@@ -1,37 +1,77 @@
 from flask import Flask, request, jsonify
-import torch
 from transformers import Wav2Vec2Processor, Wav2Vec2ForSequenceClassification
+import torch
 import torchaudio
+import os
 
 app = Flask(__name__)
 
+# Path to your locally saved model files
+MODEL_DIR = "/path/to/local_model_directory"
+processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")  # Pretrained tokenizer
+model = Wav2Vec2ForSequenceClassification.from_pretrained(MODEL_DIR, from_safetensors=True)
 
-MODEL_PATH = 'model.safetensors'
-CONFIG_PATH = 'config.json'
+# Load model to GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
 
-processor = Wav2Vec2Processor.from_pretrained(CONFIG_PATH)
-model = Wav2Vec2ForSequenceClassification.from_pretrained(CONFIG_PATH)
-model.load_state_dict(torch.load(MODEL_PATH))
+# Define allowed extensions
+ALLOWED_EXTENSIONS = {'wav'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def process_wav_file(filepath):
+    try:
+        waveform, sr = torchaudio.load(filepath)
+
+        if sr != 16000:
+            waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+
+        inputs = processor(waveform, sampling_rate=16000, return_tensors="pt", padding=True)
+        return inputs.input_values[0]
+
+    except Exception as e:
+        print(f"Error processing file {filepath}: {e}")
+        return None
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'audio' not in request.files:
-        return jsonify({'error': 'No audio file provided'}), 400
+    # Check if the request contains a file
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part in the request"}), 400
 
-    audio_file = request.files['audio']
+    file = request.files['file']
 
-    waveform, sr = torchaudio.load(audio_file)
-    if sr != 16000:
-        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)(waveform)
+    # Validate file
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
 
-    inputs = processor(waveform, sampling_rate=16000, return_tensors="pt", padding=True)
-    with torch.no_grad():
-        logits = model(inputs.input_values).logits
+    if file and allowed_file(file.filename):
+        filepath = os.path.join("/tmp", file.filename)  # Temporary file path for processing
+        file.save(filepath)
 
-    # Assume binary classification for this example
-    preds = torch.sigmoid(logits) > 0.5
+        # Process the wav file
+        input_values = process_wav_file(filepath)
+        if input_values is None:
+            return jsonify({"error": "Error processing audio file"}), 500
 
-    return jsonify({'prediction': preds.cpu().numpy().tolist()})
+        input_values = input_values.unsqueeze(0).to(device)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+        # Make predictions
+        model.eval()
+        with torch.no_grad():
+            logits = model(input_values).logits
+
+        preds = torch.sigmoid(logits).cpu().numpy()
+
+        # Binary classification: decide based on threshold
+        prediction = (preds > 0.5).astype(int)
+
+        return jsonify({"prediction": prediction.tolist()})
+
+    else:
+        return jsonify({"error": "Invalid file type. Please upload a .wav file."}), 400
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
